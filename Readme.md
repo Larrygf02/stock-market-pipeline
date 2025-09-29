@@ -6,7 +6,7 @@ This project sets up a data pipeline on an EC2 instance using Kafka, InfluxDB, a
 
 ## Project Architecture
 
-![Project Architecture](./Stock-Market-Architecture.jpg)
+![Architecture](./Stock-Market-Architecture.png)
 
 ## EC2 Diagram
 
