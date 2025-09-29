@@ -1,0 +1,26 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.tfvars
+terraform.tfvars.json
+.terraform.lock.hcl
+# Local generated keys
+*.pem
+
+# Ansible
+*.retry
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Otros
+.DS_Store

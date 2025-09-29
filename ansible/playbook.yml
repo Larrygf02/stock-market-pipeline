@@ -1,0 +1,248 @@
+---
+- name: Setup EC2 on Amazon Linux 2023
+  hosts: ec2
+  become: yes
+
+  tasks:
+    - name: Install Java 17 (Amazon Linux 2023)
+      dnf:
+        name: java-17-amazon-corretto
+        state: present
+
+    - name: Download Kafka
+      get_url:
+        url: https://dlcdn.apache.org/kafka/3.8.1/kafka_2.12-3.8.1.tgz
+        dest: /tmp/kafka.tgz
+
+    - name: Extract Kafka
+      unarchive:
+        src: /tmp/kafka.tgz
+        dest: /opt/
+        remote_src: yes
+
+    - name: Symlink Kafka
+      file:
+        src: /opt/kafka_2.12-3.8.1
+        dest: /opt/kafka
+        state: link
+
+    - name: Create Kafka data directory
+      file:
+        path: /var/lib/kafka
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+
+    - name: Asegurar permisos para el usuario kafka
+      file:
+        path: /opt/kafka
+        owner: ec2-user
+        group: ec2-user
+        mode: "0755"
+        state: directory
+
+    - name: Create Zookeeper systemd service
+      copy:
+        dest: /etc/systemd/system/zookeeper.service
+        content: |
+          [Unit]
+          Description=Apache Zookeeper
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/opt/kafka/bin/zookeeper-server-start.sh /opt/kafka/config/zookeeper.properties
+          ExecStop=/opt/kafka/bin/zookeeper-server-stop.sh
+          Restart=on-abnormal
+          User=ec2-user
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create Kafka systemd service
+      copy:
+        dest: /etc/systemd/system/kafka.service
+        content: |
+          [Unit]
+          Description=Apache Kafka
+          After=zookeeper.service
+
+          [Service]
+          Type=simple
+          Environment="KAFKA_HEAP_OPTS=-Xmx256M -Xms128M"
+          ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+          ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+          Restart=on-abnormal
+          User=ec2-user
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Enable and start Zookeeper
+      systemd:
+        name: zookeeper
+        state: started
+        enabled: yes
+
+    - name: Enable and start Kafka
+      systemd:
+        name: kafka
+        state: started
+        enabled: yes
+
+    - name: Wait for Kafka to start
+      wait_for:
+        port: 9092
+        delay: 10
+        timeout: 60
+
+    - name: Create Kafka topic
+      command: >
+        /opt/kafka/bin/kafka-topics.sh
+        --create
+        --topic stock_topic
+        --bootstrap-server localhost:9092
+        --partitions 1
+        --replication-factor 1
+      args:
+        creates: /tmp/topic_created
+      register: topic_result
+      failed_when: "'already exists' not in topic_result.stderr and topic_result.rc != 0"
+
+    - name: Mark topic as created
+      file:
+        path: /tmp/topic_created
+        state: touch
+
+    - name: Update dnf packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+
+    - name: Install Docker
+      ansible.builtin.dnf:
+        name: docker
+        state: present
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create Docker network
+      community.docker.docker_network:
+        name: stock_red
+        state: present
+
+    - name: Crear carpeta data
+      ansible.builtin.file:
+        path: /opt/influxdb/data
+        state: directory
+        mode: "0777"
+
+    - name: Crear carpeta plugins
+      ansible.builtin.file:
+        path: /opt/influxdb/plugins
+        state: directory
+        mode: "0777"
+
+    - name: Run InfluxDB container
+      community.docker.docker_container:
+        name: influxdb_dev
+        image: influxdb:3-core
+        command: >
+          influxdb3 serve
+          --node-id=my-node-0
+          --object-store=file
+          --data-dir=/var/lib/influxdb3/data
+          --plugin-dir=/var/lib/influxdb3/plugins
+        state: started
+        restart_policy: always
+        ports:
+          - "8181:8181"
+        networks:
+          - name: stock_red
+        volumes:
+          - /opt/influxdb/data:/var/lib/influxdb3/data
+          - /opt/influxdb/plugins:/var/lib/influxdb3/plugins
+
+    - name: Crear token admin en InfluxDB (JSON)
+      ansible.builtin.command: >
+        docker exec influxdb_dev influxdb3 create token --admin --format json
+      register: influxdb_token_cmd
+      changed_when: true
+
+    - name: Parsear JSON para obtener el token
+      set_fact:
+        influxdb_token: "{{ (influxdb_token_cmd.stdout | from_json).token }}"
+
+    - name: Crear archivo de entorno para InfluxDB
+      ansible.builtin.copy:
+        dest: /etc/profile.d/influx.sh
+        content: |
+          export INFLUXDB3_AUTH_TOKEN={{ influxdb_token }}
+        mode: "0644"
+
+    - name: Aplicar la variable de entorno en la sesión actual
+      ansible.builtin.shell: source /etc/profile.d/influx.sh
+      args:
+        executable: /bin/bash
+
+    - name: Copiar carpeta src al EC2
+      ansible.builtin.copy:
+        src: ../src
+        dest: /home/ec2-user/
+        owner: ec2-user
+        group: ec2-user
+        mode: "0755"
+
+    - name: Run Grafana container
+      community.docker.docker_container:
+        name: grafana
+        image: grafana/grafana:latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: stock_red
+        ports:
+          - "3000:3000"
+        env:
+          INFLUXDB_TOKEN: "{{ influxdb_token }}"
+        volumes:
+          - "/home/ec2-user/src/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources"
+          - "/home/ec2-user/src/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards"
+          - "/home/ec2-user/src/grafana/dashboards:/var/lib/grafana/dashboards"
+
+    - name: Instalar Python3 y venv
+      ansible.builtin.dnf:
+        name:
+          - python3
+          - python3-virtualenv
+          - python3-pip
+        state: present
+
+    - name: Crear venv para producer
+      ansible.builtin.command:
+        cmd: python3 -m venv /opt/venvs/producer
+        creates: /opt/venvs/producer/bin/activate
+
+    - name: Instalar requirements de producer
+      ansible.builtin.pip:
+        requirements: /home/ec2-user/src/producer/requirements.txt
+        virtualenv: /opt/venvs/producer
+        virtualenv_command: python3 -m venv
+
+    - name: Crear venv para consumer influxdb
+      ansible.builtin.command:
+        cmd: python3 -m venv /opt/venvs/consumer_influxdb
+        creates: /opt/venvs/consumer_influxdb/bin/activate
+
+    - name: Instalar requirements de consumer influxdb
+      ansible.builtin.pip:
+        requirements: /home/ec2-user/src/consumer_influxdb/requirements.txt
+        virtualenv: /opt/venvs/consumer_influxdb
+        virtualenv_command: python3 -m venv
